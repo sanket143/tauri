@@ -1,10 +1,15 @@
 const parseArgs = require('minimist')
-const tauriCreate = require('./tauri-create')
+const inquirer = require('inquirer')
+const { resolve } = require('path')
+const { merge } = require('lodash')
+const {
+  recipeShortNames,
+  recipeDescriptiveNames,
+  recipeByDescriptiveName,
+  recipeByShortName
+} = require('../dist/api/recipes')
 
 /**
- * init is an alias for create -r none, same as
- * creating a fresh tauri project with no UI recipe applied.
- *
  * @type {object}
  * @property {boolean} h
  * @property {boolean} help
@@ -14,22 +19,36 @@ const tauriCreate = require('./tauri-create')
  * @property {boolean} log
  * @property {boolean} d
  * @property {boolean} directory
+ * @property {string} r
+ * @property {string} recipe
  */
 function main(cliArgs) {
   const argv = parseArgs(cliArgs, {
     alias: {
-      h: 'help'
+      h: 'help',
+      f: 'force',
+      l: 'log',
+      d: 'directory',
+      t: 'tauri-path',
+      A: 'app-name',
+      W: 'window-title',
+      D: 'dist-dir',
+      P: 'dev-path',
+      r: 'recipe'
     },
-    boolean: ['h']
+    boolean: ['h', 'l', 'ci']
   })
 
   if (argv.help) {
     printUsage()
-    process.exit(0)
+    return 0
   }
 
-  // delegate actual work to create command
-  tauriCreate([...cliArgs, '-r', 'none'])
+  if (argv.ci) {
+    runInit(argv)
+  } else {
+    getOptionsInteractive(argv).then((responses) => runInit(argv, responses))
+  }
 }
 
 function printUsage() {
@@ -50,7 +69,139 @@ function printUsage() {
     --window-title, -W   Window title of your Tauri application
     --dist-dir, -D       Web assets location, relative to <project-dir>/src-tauri
     --dev-path, -P       Url of your dev server
+    --recipe, -r         Add UI framework recipe. None by default. 
+                         Supported recipes: [${recipeShortNames.join('|')}]
     `)
+}
+
+const getOptionsInteractive = (argv) => {
+  let defaultAppName = argv.A
+  if (!defaultAppName) {
+    try {
+      const packageJson = JSON.parse(
+        readFileSync(resolve(process.cwd(), 'package.json')).toString()
+      )
+      defaultAppName = packageJson.displayName || packageJson.name
+    } catch {}
+  }
+
+  return inquirer
+    .prompt([
+      {
+        type: 'input',
+        name: 'appName',
+        message: 'What is your app name?',
+        default: defaultAppName,
+        when: !argv.A
+      },
+      {
+        type: 'input',
+        name: 'tauri.window.title',
+        message: 'What should the window title be?',
+        default: 'Tauri App',
+        when: () => !argv.W
+      },
+      {
+        type: 'list',
+        name: 'recipeName',
+        message: 'Would you like to add a UI recipe?',
+        choices: recipeDescriptiveNames,
+        default: 'No recipe',
+        when: () => !argv.r
+      }
+    ])
+    .then((answers) =>
+      inquirer
+        .prompt([
+          {
+            type: 'input',
+            name: 'build.devPath',
+            message: 'What is the url of your dev server?',
+            default: 'http://localhost:4000',
+            when: () =>
+              (!argv.P && !argv.p && answers.recipeName === 'No recipe') ||
+              argv.r === 'none'
+          },
+          {
+            type: 'input',
+            name: 'build.distDir',
+            message:
+              'Where are your web assets (HTML/CSS/JS) located, relative to the "<current dir>/src-tauri" folder that will be created?',
+            default: '../dist',
+            when: () =>
+              (!argv.D && answers.recipeName === 'No recipe') ||
+              argv.r === 'none'
+          }
+        ])
+        .then((answers2) => ({ ...answers, ...answers2 }))
+    )
+    .catch((error) => {
+      if (error.isTtyError) {
+        // Prompt couldn't be rendered in the current environment
+        console.log(
+          'It appears your terminal does not support interactive prompts. Using default values.'
+        )
+        runInit()
+      } else {
+        // Something else when wrong
+        console.error('An unknown error occurred:', error)
+      }
+    })
+}
+
+async function runInit(argv, config = {}) {
+  const { appName, recipeName, ...configOptions } = config
+  const init = require('../dist/api/init')
+
+  let recipe
+  let recipeSelection = 'none'
+
+  if (recipeName !== undefined) {
+    recipe = recipeByDescriptiveName(recipeName)
+  } else if (argv.r) {
+    recipe = recipeByShortName(argv.r)
+  }
+
+  let buildConfig = {
+    distDir: argv.D,
+    devPath: argv.P
+  }
+
+  if (recipe !== undefined) {
+    recipeSelection = recipe.shortName
+    buildConfig = recipe.configUpdate(buildConfig)
+  }
+
+  const directory = argv.d || process.cwd()
+
+  init({
+    directory,
+    force: argv.f || null,
+    logging: argv.l || null,
+    tauriPath: argv.t || null,
+    appName: appName || argv.A || null,
+    customConfig: merge(configOptions, {
+      build: buildConfig,
+      tauri: {
+        window: {
+          title: argv.W
+        }
+      }
+    })
+  })
+
+  const { installDependencies } = require('../dist/api/dependency-manager')
+  await installDependencies()
+
+  if (recipe !== undefined) {
+    const {
+      installRecipeDependencies,
+      runRecipePostConfig
+    } = require('../dist/api/recipes/install')
+
+    await installRecipeDependencies(recipe, directory)
+    await runRecipePostConfig(recipe, directory)
+  }
 }
 
 module.exports = main
